@@ -110,7 +110,7 @@ def test_api_readiness_and_queries(platform):
     status, timeline = api.handle("GET", "/api/timeline", {"train_id": "T01"}, {})
     assert status == 200 and timeline["timeline"][0]["kind"] == "arrival"
     status, store = api.handle("GET", "/api/store", {}, {})
-    assert status == 200 and "quota/arrival" in store["documents"]
+    assert status == 200 and "quota/snapshot" in store["documents"]
     status, namespace = api.handle("GET", "/api/namespace", {}, {})
     assert status == 200 and namespace["line"] == "L1"
     status, gate = api.handle("GET", "/api/doors/ST1-G01-01", {}, {})

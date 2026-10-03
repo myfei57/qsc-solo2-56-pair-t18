@@ -42,7 +42,14 @@
   },
   "quota": {
     "arrival_limit": 1000,
-    "depart_limit": 1000
+    "depart_limit": 1000,
+    "station_arrival_limit": 200,
+    "station_depart_limit": 200,
+    "train_arrival_limit": 50,
+    "train_depart_limit": 50,
+    "period_s": 300.0,
+    "repay_mode": "auto",
+    "grace_periods": 1
   },
   "audit": {
     "journal_segment": 512

@@ -66,7 +66,10 @@ class Api:
         add("GET", "/api/doors/{psdID}", self._gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
-        add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
+        add("GET", "/api/quota", lambda params, body: self._platform.quota_status())
+        add("GET", "/api/quota/loans", lambda params, body: {"loans": self._platform.quota_engine.loans()})
+        add("GET", "/api/quota/ledger", self._quota_ledger)
+        add("POST", "/api/quota/repay", self._quota_repay)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
@@ -176,14 +179,22 @@ class Api:
         )
 
     def _readiness(self, params: dict, body: dict) -> dict:
+        quota = self._platform.quota_engine.status()
         checks = {
             "stations": bool(self._platform.stations.list()),
             "gates": bool(self._platform.gates.list()),
-            "quota_arrival": self._platform.quotas.status("arrival")["configured"],
-            "quota_depart": self._platform.quotas.status("depart")["configured"],
+            "quota_arrival": quota["line"]["arrival"]["configured"],
+            "quota_depart": quota["line"]["depart"]["configured"],
             "audit_log": self._platform.audit.journal.count() >= 0,
         }
         return {"ready": all(checks.values()), "checks": checks}
+
+    def _quota_ledger(self, params: dict, body: dict) -> dict:
+        limit = int(params.get("limit", 50))
+        return {"records": self._platform.quota_records(limit)}
+
+    def _quota_repay(self, params: dict, body: dict) -> dict:
+        return self._platform.repay_loan(_require(body, "loan_id"))
 
     # ---- 动作 ---------------------------------------------------------
 
@@ -192,10 +203,17 @@ class Api:
             _require(body, "train_id"),
             _require(body, "station_id"),
             _as_int(body, "position_m", 0),
+            priority=_as_int(body, "priority", 0),
+            repay_mode=str(body.get("repay_mode", "") or "") or None,
         )
 
     def _depart(self, params: dict, body: dict) -> dict:
-        return self._platform.depart(_require(body, "train_id"), _require(body, "station_id"))
+        return self._platform.depart(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            priority=_as_int(body, "priority", 0),
+            repay_mode=str(body.get("repay_mode", "") or "") or None,
+        )
 
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))

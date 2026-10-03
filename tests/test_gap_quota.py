@@ -1,12 +1,11 @@
-"""间隙探测与运行配额。"""
+"""间隙探测登记。"""
 
 from __future__ import annotations
 
 import pytest
 
-from psdline.errors import InterlockError, RailError
+from psdline.errors import InterlockError
 from psdline.gap import GapRegistry, gap_status, gap_summary
-from psdline.quota import QuotaRegistry
 from psdline.store import JsonStore
 
 
@@ -39,21 +38,3 @@ def test_gap_reports(tmp_path):
     summary = gap_summary(gaps, ["T01", "T02"])
     assert summary["count"] == 2 and summary["clear"] == 1
     assert summary["blocked"] == ["T02"]
-
-
-def test_quota_consume_and_reset(tmp_path):
-    quotas = QuotaRegistry(JsonStore(str(tmp_path)))
-    quotas.set_limit("arrival", 2)
-    assert quotas.consume("arrival") is True
-    assert quotas.consume("arrival") is True
-    assert quotas.consume("arrival") is False
-    assert quotas.remaining("arrival") == 0
-    quotas.reset("arrival")
-    assert quotas.remaining("arrival") == 2
-    assert quotas.status("arrival")["configured"] is True
-    assert quotas.status("depart")["configured"] is False
-    with pytest.raises(RailError):
-        quotas.consume("depart")
-    with pytest.raises(RailError):
-        quotas.set_limit("arrival", 0)
-    assert quotas.reset("depart") is None

@@ -89,10 +89,23 @@ class InterlockSection:
 
 @dataclass(frozen=True)
 class QuotaSection:
-    """运行配额。"""
+    """分级运行配额：线路、站台、列车三级份额与借还策略。
+
+    ``arrival_limit`` / ``depart_limit`` 是线路总上限；站台与列车份额是每级
+    每个作用域的周期额度。``period_s`` 是配额周期长度；借据下个周期到期，
+    ``repay_mode`` 决定默认归还方式（``auto`` 翻篇自动扣还 / ``manual`` 人工
+    确认），人工借据逾期超过 ``grace_periods`` 个周期后强制清算。
+    """
 
     arrival_limit: int = 1000
     depart_limit: int = 1000
+    station_arrival_limit: int = 200
+    station_depart_limit: int = 200
+    train_arrival_limit: int = 50
+    train_depart_limit: int = 50
+    period_s: float = 300.0
+    repay_mode: str = "auto"
+    grace_periods: int = 1
 
 
 @dataclass(frozen=True)
@@ -165,8 +178,22 @@ class PlatformConfig:
             raise ConfigError("序号模数固定为 65536", component="config")
         if not 0 < self.interlock.max_locked_ratio <= 1:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
-        if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
-            raise ConfigError("运行配额必须为正", component="config")
+        quota_limits = (
+            self.quota.arrival_limit,
+            self.quota.depart_limit,
+            self.quota.station_arrival_limit,
+            self.quota.station_depart_limit,
+            self.quota.train_arrival_limit,
+            self.quota.train_depart_limit,
+        )
+        if any(limit <= 0 for limit in quota_limits):
+            raise ConfigError("分级运行配额必须为正", component="config")
+        if self.quota.period_s <= 0:
+            raise ConfigError("配额周期必须为正", component="config")
+        if self.quota.repay_mode not in ("auto", "manual"):
+            raise ConfigError("归还方式必须是 auto 或 manual", component="config")
+        if self.quota.grace_periods < 0:
+            raise ConfigError("借据宽限周期数不能为负", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:

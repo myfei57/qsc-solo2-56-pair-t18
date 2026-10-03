@@ -45,7 +45,7 @@ from .interlock import (
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
-from .quota import QuotaRegistry
+from .quota import QuotaEngine, QuotaLedger, line_scope, station_scope
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
 from .station import (
     DoorZone,
@@ -127,7 +127,25 @@ class Platform:
         self.armers = InterlockArmer(store)
         self.mappings = MappingRegistry(store)
         self.gaps = GapRegistry(store)
-        self.quotas = QuotaRegistry(store)
+        self.quota_ledger = QuotaLedger(
+            store, self.clock, segment_limit=self.config.audit.journal_segment
+        )
+        self.quota_engine = QuotaEngine(
+            self.quota_ledger,
+            self.clock,
+            line_id=self.namespace.line_id(),
+            period_s=self.config.quota.period_s,
+            repay_mode=self.config.quota.repay_mode,
+            grace_periods=self.config.quota.grace_periods,
+            limits={
+                ("line", ARRIVAL): self.config.quota.arrival_limit,
+                ("line", DEPART): self.config.quota.depart_limit,
+                ("station", ARRIVAL): self.config.quota.station_arrival_limit,
+                ("station", DEPART): self.config.quota.station_depart_limit,
+                ("train", ARRIVAL): self.config.quota.train_arrival_limit,
+                ("train", DEPART): self.config.quota.train_depart_limit,
+            },
+        )
         self.commands = CommandLog(store)
         self.doors = DoorController(
             store, self.align, self.commands, self.gates, self.lockouts
@@ -202,11 +220,19 @@ class Platform:
                             group=group,
                         )
                     )
-        for name, limit in (
+        line = line_scope(self.namespace.line_id())
+        for kind, limit in (
             (ARRIVAL, self.config.quota.arrival_limit),
             (DEPART, self.config.quota.depart_limit),
         ):
-            self.quotas.set_limit(name, limit)
+            self.quota_engine.configure(line, kind, limit)
+        for station_id in self.namespace.station_ids():
+            scope = station_scope(station_id)
+            for kind, limit in (
+                (ARRIVAL, self.config.quota.station_arrival_limit),
+                (DEPART, self.config.quota.station_depart_limit),
+            ):
+                self.quota_engine.configure(scope, kind, limit)
         store.write(
             seed_doc,
             {"line": self.namespace.line_id(), "stations": self.namespace.station_ids()},
@@ -233,6 +259,34 @@ class Platform:
                 "line": self.namespace.line_id(),
             },
         )
+
+    def _publish_quota(self, decision: dict, train_id: str, station_id: str) -> None:
+        """把配额判定与随单借据发到总线，供控制台与审计对照账本。"""
+
+        self.bus.publish(
+            Event.of(
+                "quota",
+                "quota",
+                "consume" if decision["ok"] else "deny",
+                train_id=train_id,
+                station_id=station_id,
+                severity="notice" if decision["ok"] else "alarm",
+                record_id=decision["record_id"],
+                reason=decision["reason"],
+            )
+        )
+        for loan_id in decision.get("loans", []):
+            self.bus.publish(
+                Event.of(
+                    "quota",
+                    "quota",
+                    "borrow",
+                    train_id=train_id,
+                    station_id=station_id,
+                    severity="notice",
+                    loan_id=loan_id,
+                )
+            )
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写事件，并记一条汇总审计。"""
@@ -346,8 +400,19 @@ class Platform:
 
     # ---- 到发编排 -----------------------------------------------------
 
-    def arrive(self, train_id: str, station_id: str, position_m: int) -> dict:
-        """到站到开门：信号到站 → 停稳对位 → 对位落盘 → 开门。"""
+    def arrive(
+        self,
+        train_id: str,
+        station_id: str,
+        position_m: int,
+        priority: int = 0,
+        repay_mode: str | None = None,
+    ) -> dict:
+        """到站到开门：配额 → 信号到站 → 停稳对位 → 对位落盘 → 开门。
+
+        配额按列车、站台、线路三级同时扣减，站台不够时向上借；后续步骤失败
+        时冲正本次配额消费（连同随单借据），不让失败的编排占用额度。
+        """
 
         op_id = self.ids.labeled("arrive")
         steps: list[dict] = []
@@ -375,14 +440,22 @@ class Platform:
                 "violations": violations,
             }
 
-        if not self.quotas.consume(ARRIVAL):
-            return reject("到站配额已用完")
         try:
             self.namespace.require(station_id)
         except RailError as error:
             return reject(error.message)
         if self.stations.get(station_id) is None:
             return reject(f"站台未登记: {station_id}")
+
+        decision = self.quota_engine.acquire(
+            train_id, station_id, ARRIVAL, priority=priority, repay_mode=repay_mode
+        )
+        self._publish_quota(decision, train_id, station_id)
+        if not decision["ok"]:
+            return reject(decision["reason"])
+
+        def refund(reason: str) -> None:
+            self.quota_engine.refund(decision["record_id"], reason=reason)
 
         self.signals.raise_signal(train_id, ARRIVAL, self.clock.now())
         steps.append(
@@ -396,6 +469,7 @@ class Platform:
         try:
             alignment = self.align.align(train_id, position_m, stop_position, self.clock.now())
         except RailError as error:
+            refund(error.message)
             return reject(error.message)
         steps.append(
             {
@@ -407,13 +481,17 @@ class Platform:
         try:
             self.doors_open(train_id, station_id)
         except RailError as error:
+            refund(error.message)
             return reject(error.message)
-        entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
+        entry = self.audit.record(
+            ARRIVAL, train_id, station_id, position_m=position_m, quota_record=decision["record_id"]
+        )
         report = {
             "ok": True,
             "train_id": train_id,
             "station_id": station_id,
             "position_m": alignment.position_m,
+            "quota": {"record_id": decision["record_id"], "loans": decision["loans"]},
             "steps": steps,
             "violations": [],
         }
@@ -443,18 +521,43 @@ class Platform:
         )
         return {**report, "group": group}
 
-    def depart(self, train_id: str, station_id: str) -> dict:
-        """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
+    def depart(
+        self,
+        train_id: str,
+        station_id: str,
+        priority: int = 0,
+        repay_mode: str | None = None,
+    ) -> dict:
+        """关门到发车：配额 → 关门指令 → 间隙探测 → 关门落盘 → 发车信号。
+
+        配额先取后退：任何一步失败都冲正本次发车配额，记录留在账本里。
+        """
 
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
-        if not self.quotas.consume(DEPART):
+        decision = self.quota_engine.acquire(
+            train_id, station_id, DEPART, priority=priority, repay_mode=repay_mode
+        )
+        self._publish_quota(decision, train_id, station_id)
+        if not decision["ok"]:
             report = {
                 "ok": False,
                 "train_id": train_id,
                 "station_id": station_id,
                 "steps": steps,
-                "violations": ["发车配额已用完"],
+                "violations": [decision["reason"]],
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
+
+        def fail(reasons: list[str]) -> dict:
+            self.quota_engine.refund(decision["record_id"], reason="; ".join(reasons))
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": list(reasons),
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
@@ -470,15 +573,7 @@ class Platform:
                 self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
             )
         except RailError as error:
-            report = {
-                "ok": False,
-                "train_id": train_id,
-                "station_id": station_id,
-                "steps": steps,
-                "violations": [error.message],
-            }
-            summary = self._record_operation(op_id, "depart", report)
-            return {**report, **summary}
+            return fail([error.message])
         steps.append(
             {"component": "door", "action": "close_durable", "detail": {"train_id": train_id}}
         )
@@ -492,15 +587,7 @@ class Platform:
         )
         verdict = depart_checked(self.signals, self.store, self.gaps, train_id, self.clock.now())
         if not verdict["ok"]:
-            report = {
-                "ok": False,
-                "train_id": train_id,
-                "station_id": station_id,
-                "steps": steps,
-                "violations": list(verdict["violations"]),
-            }
-            summary = self._record_operation(op_id, "depart", report)
-            return {**report, **summary}
+            return fail(list(verdict["violations"]))
         steps.append(
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
@@ -514,6 +601,7 @@ class Platform:
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
             "cleared_commands": departure["cleared_commands"],
+            "quota": {"record_id": decision["record_id"], "loans": decision["loans"]},
             "steps": steps,
             "violations": [],
         }
@@ -666,6 +754,45 @@ class Platform:
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
 
+    # ---- 配额借还 -----------------------------------------------------
+
+    def repay_loan(self, loan_id: str) -> dict:
+        """人工确认归还一笔借据；还不起的部分当场降级并砍单。"""
+
+        outcome = self.quota_engine.repay(loan_id)
+        degrade = outcome.get("degrade")
+        self.bus.publish(
+            Event.of(
+                "quota",
+                "quota",
+                "degrade" if degrade else "repay",
+                severity="alarm" if degrade else "notice",
+                loan_id=loan_id,
+                repaid=outcome["repaid"],
+                cuts=list(degrade.get("cuts", [])) if degrade else [],
+            )
+        )
+        entry = self.audit.record(
+            "quota_repay",
+            "",
+            "",
+            loan_id=loan_id,
+            repaid=outcome["repaid"],
+            degraded=bool(degrade),
+            cuts=list(degrade.get("cuts", [])) if degrade else [],
+        )
+        return {**outcome, "audit_id": entry.id, "violations": []}
+
+    def quota_status(self) -> dict:
+        """返回分级配额状态（与到发编排读同一份账）。"""
+
+        return self.quota_engine.status()
+
+    def quota_records(self, limit: int = 50) -> list[dict]:
+        """返回配额账本尾部记录，供审计逐条核对。"""
+
+        return self.quota_engine.ledger_tail(limit)
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -675,6 +802,20 @@ class Platform:
             return {"ok": False, "violations": ["步长必须为正"], "cycle": self._cycles}
         self._cycles += 1
         moment = self.clock.now()
+        quota_tick = self.quota_engine.tick()
+        for settle in quota_tick["settles"]:
+            degrade = settle.get("degrade")
+            self.bus.publish(
+                Event.of(
+                    "quota",
+                    "quota",
+                    "degrade" if degrade else "repay",
+                    severity="alarm" if degrade else "notice",
+                    loan_id=settle.get("loan_id", ""),
+                    repaid=settle.get("repaid", 0),
+                    cuts=list(degrade.get("cuts", [])) if degrade else [],
+                )
+            )
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
@@ -697,6 +838,7 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "quota": quota_tick,
             "violations": [],
         }
 
@@ -742,10 +884,7 @@ class Platform:
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
             ),
             "gaps": gap_summary(self.gaps, ids),
-            "quota": {
-                ARRIVAL: self.quotas.status(ARRIVAL),
-                DEPART: self.quotas.status(DEPART),
-            },
+            "quota": self.quota_engine.status(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "trend": self.trend.snapshot(limit=4),
@@ -773,6 +912,7 @@ class Platform:
                 for station_id in self.namespace.station_ids()
             },
             "adjacent": self._adjacent_sample(),
+            "quota_ledger": self.quota_engine.ledger_tail(20),
             "timeline": build_timeline(self.audit.list(), limit=20),
         }
 
