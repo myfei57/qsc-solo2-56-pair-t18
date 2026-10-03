@@ -182,6 +182,65 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_quota_status(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(
+        {
+            "hierarchical": platform.quota_status(),
+            "ledger": platform.quota_ledger_info(),
+        }
+    )
+    return 0
+
+
+def _cmd_quota_settle(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.settle_quota_cycle() if not getattr(args, "idem", "")
+          else platform.quota_book.settle_cycle(idem=args.idem))
+    return 0
+
+
+def _cmd_quota_confirm(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.confirm_quota_return(args.loan_ids or None))
+    return 0
+
+
+def _cmd_quota_downgrade(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.downgrade_train(args.train_id, args.reason))
+    return 0
+
+
+def _cmd_quota_restore(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.restore_train(args.train_id))
+    return 0
+
+
+def _cmd_quota_repay(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.repay_quota_loan(args.loan_id))
+    return 0
+
+
+def _cmd_quota_policy(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(
+        platform.set_quota_policy(
+            return_mode=args.return_mode, downgrade_policy=args.downgrade_policy
+        )
+    )
+    return 0
+
+
+def _cmd_quota_verify(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    result = platform.quota_ledger.verify()
+    _dump(result)
+    return 0 if result["ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +275,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    quota = sub.add_parser("quota", help="分级配额操作", parents=[common])
+    quota_sub = quota.add_subparsers(dest="quota_action", required=True)
+    q_status = quota_sub.add_parser("status", help="查看分级配额台账")
+    q_status.set_defaults(func=_cmd_quota_status)
+    q_settle = quota_sub.add_parser("settle", help="推进一个配额周期（自动归还/降级）")
+    q_settle.add_argument("--idem", default="", help="幂等键（防重试重复结算）")
+    q_settle.set_defaults(func=_cmd_quota_settle)
+    q_confirm = quota_sub.add_parser("confirm-return", help="人工确认归还挂账贷款")
+    q_confirm.add_argument("loan_ids", nargs="*", help="贷款 id；留空归还全部 due")
+    q_confirm.set_defaults(func=_cmd_quota_confirm)
+    q_down = quota_sub.add_parser("downgrade", help="人工降级一列车")
+    q_down.add_argument("train_id")
+    q_down.add_argument("--reason", default="manual")
+    q_down.set_defaults(func=_cmd_quota_downgrade)
+    q_restore = quota_sub.add_parser("restore", help="恢复被降级的列车")
+    q_restore.add_argument("train_id")
+    q_restore.set_defaults(func=_cmd_quota_restore)
+    q_repay = quota_sub.add_parser("repay", help="人工补还历史挂账贷款")
+    q_repay.add_argument("loan_id")
+    q_repay.set_defaults(func=_cmd_quota_repay)
+    q_policy = quota_sub.add_parser("policy", help="切换归还模式/降级策略")
+    q_policy.add_argument("--return-mode", choices=["auto", "manual"], default=None)
+    q_policy.add_argument(
+        "--downgrade-policy", choices=["priority", "arrival"], default=None
+    )
+    q_policy.set_defaults(func=_cmd_quota_policy)
+    q_verify = quota_sub.add_parser("verify", help="校验配额账本哈希链")
+    q_verify.set_defaults(func=_cmd_quota_verify)
     return parser
 
 

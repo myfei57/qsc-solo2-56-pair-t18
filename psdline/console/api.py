@@ -67,6 +67,17 @@ class Api:
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
+        add("GET", "/api/quota/hierarchy", self._quota_hierarchy)
+        add("GET", "/api/quota/audit", self._quota_audit)
+        add("POST", "/api/quota/settle", self._quota_settle)
+        add("POST", "/api/quota/confirm-return", self._quota_confirm)
+        add("POST", "/api/quota/downgrade", self._quota_downgrade)
+        add("POST", "/api/quota/reclaim", self._quota_reclaim)
+        add("POST", "/api/quota/restore", self._quota_restore)
+        add("POST", "/api/quota/repay", self._quota_repay)
+        add("POST", "/api/quota/priority", self._quota_priority)
+        add("POST", "/api/quota/grants", self._quota_grants)
+        add("POST", "/api/quota/policy", self._quota_policy)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
@@ -176,14 +187,80 @@ class Api:
         )
 
     def _readiness(self, params: dict, body: dict) -> dict:
+        verify = self._platform.quota_ledger.verify()
         checks = {
             "stations": bool(self._platform.stations.list()),
             "gates": bool(self._platform.gates.list()),
             "quota_arrival": self._platform.quotas.status("arrival")["configured"],
             "quota_depart": self._platform.quotas.status("depart")["configured"],
+            "quota_ledger": bool(verify["ok"]),
             "audit_log": self._platform.audit.journal.count() >= 0,
         }
         return {"ready": all(checks.values()), "checks": checks}
+
+    # ---- 分级配额 -----------------------------------------------------
+
+    def _quota_hierarchy(self, params: dict, body: dict) -> dict:
+        return {
+            "hierarchical": self._platform.quota_status(),
+            "ledger": self._platform.quota_ledger_info(),
+        }
+
+    def _quota_audit(self, params: dict, body: dict) -> dict:
+        return {"entries": self._platform.quota_audit(int(params.get("limit", 200)))}
+
+    def _quota_settle(self, params: dict, body: dict) -> dict:
+        return self._platform.settle_quota_cycle()
+
+    def _quota_confirm(self, params: dict, body: dict) -> dict:
+        loan_ids = body.get("loan_ids")
+        if loan_ids is not None and not isinstance(loan_ids, list):
+            raise RailError("loan_ids 必须是数组", component="console")
+        return self._platform.confirm_quota_return(
+            [str(item) for item in loan_ids] if loan_ids else None
+        )
+
+    def _quota_downgrade(self, params: dict, body: dict) -> dict:
+        return self._platform.downgrade_train(
+            _require(body, "train_id"), str(body.get("reason", "manual"))
+        )
+
+    def _quota_reclaim(self, params: dict, body: dict) -> dict:
+        kind = str(body.get("kind", "arrival"))
+        return self._platform.reclaim_capacity(
+            kind,
+            _require(body, "station_id"),
+            need=_as_int(body, "need", 1),
+        )
+
+    def _quota_restore(self, params: dict, body: dict) -> dict:
+        return self._platform.restore_train(_require(body, "train_id"))
+
+    def _quota_repay(self, params: dict, body: dict) -> dict:
+        return self._platform.repay_quota_loan(_require(body, "loan_id"))
+
+    def _quota_priority(self, params: dict, body: dict) -> dict:
+        return self._platform.set_train_priority(
+            _require(body, "train_id"), _as_int(body, "priority", 100)
+        )
+
+    def _quota_grants(self, params: dict, body: dict) -> dict:
+        grants = body.get("grants")
+        if not isinstance(grants, list) or not grants:
+            raise RailError("grants 必须是非空数组", component="console")
+        return self._platform.set_quota_grants(grants)
+
+    def _quota_policy(self, params: dict, body: dict) -> dict:
+        return self._platform.set_quota_policy(
+            return_mode=(
+                str(body["return_mode"]) if body.get("return_mode") is not None else None
+            ),
+            downgrade_policy=(
+                str(body["downgrade_policy"])
+                if body.get("downgrade_policy") is not None
+                else None
+            ),
+        )
 
     # ---- 动作 ---------------------------------------------------------
 

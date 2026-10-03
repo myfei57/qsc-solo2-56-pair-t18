@@ -89,10 +89,27 @@ class InterlockSection:
 
 @dataclass(frozen=True)
 class QuotaSection:
-    """运行配额。"""
+    """分级运行配额。
+
+    线路发放量是全线到/发硬总车位；各站台发放量是其中的切片（之和不超过线路
+    总量）；列车发放量是每列车进站时自带的额度。三级都不够时沿
+    列车→站台→线路 向上借。
+
+    ``return_mode``：``auto`` 为周期时间窗自动归还（可能误伤在途车）；
+    ``manual`` 为人工确认归还（可能因拖延沉淀额度）。
+    ``downgrade_policy``：``priority`` 先砍低优先级（同级按到站顺序）；
+    ``arrival`` 完全按到站顺序砍。
+    """
 
     arrival_limit: int = 1000
     depart_limit: int = 1000
+    platform_arrival_limit: int = 200
+    platform_depart_limit: int = 200
+    train_arrival_limit: int = 1
+    train_depart_limit: int = 1
+    return_mode: str = "auto"
+    downgrade_policy: str = "priority"
+    settle_every_cycles: int = 0
 
 
 @dataclass(frozen=True)
@@ -167,6 +184,16 @@ class PlatformConfig:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
         if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
             raise ConfigError("运行配额必须为正", component="config")
+        if self.quota.platform_arrival_limit < 0 or self.quota.platform_depart_limit < 0:
+            raise ConfigError("站台配额不能为负", component="config")
+        if self.quota.train_arrival_limit < 0 or self.quota.train_depart_limit < 0:
+            raise ConfigError("列车配额不能为负", component="config")
+        if self.quota.return_mode not in ("auto", "manual"):
+            raise ConfigError("归还模式必须是 auto 或 manual", component="config")
+        if self.quota.downgrade_policy not in ("priority", "arrival"):
+            raise ConfigError("降级策略必须是 priority 或 arrival", component="config")
+        if self.quota.settle_every_cycles < 0:
+            raise ConfigError("配额结算周期不能为负", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:

@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import os
+
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
@@ -45,6 +47,16 @@ from .interlock import (
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
+from .quota import (
+    ARRIVAL as Q_ARRIVAL,
+    DEPART as Q_DEPART,
+    Grant,
+    LEVEL_LINE as Q_LEVEL_LINE,
+    LEVEL_PLATFORM as Q_LEVEL_PLATFORM,
+    QuotaBook,
+    QuotaError,
+    QuotaLedger,
+)
 from .quota import QuotaRegistry
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
 from .station import (
@@ -128,6 +140,11 @@ class Platform:
         self.mappings = MappingRegistry(store)
         self.gaps = GapRegistry(store)
         self.quotas = QuotaRegistry(store)
+        # 分级配额：线路/站台/列车三级，只追加哈希链账本，是配额的唯一事实来源。
+        quota_path = os.path.join(store.root, "quota-ledger.jsonl")
+        self.quota_ledger = QuotaLedger(quota_path)
+        self.quota_ledger.recover()
+        self.quota_book = QuotaBook(self.quota_ledger, self.clock, actor="platform")
         self.commands = CommandLog(store)
         self.doors = DoorController(
             store, self.align, self.commands, self.gates, self.lockouts
@@ -207,10 +224,59 @@ class Platform:
             (DEPART, self.config.quota.depart_limit),
         ):
             self.quotas.set_limit(name, limit)
+        self._seed_hierarchical_quota()
         store.write(
             seed_doc,
             {"line": self.namespace.line_id(), "stations": self.namespace.station_ids()},
         )
+
+    def _seed_hierarchical_quota(self) -> None:
+        """按配置建立线路/站台两级发放；列车额度在到站时登记。
+
+        账本只追加，已建账则 initialize 幂等返回，站台额度按各站台统一切片发放，
+        且各站台切片之和不超过线路总量（装配期用最小值兜底，避免非法默认值）。
+        """
+
+        q = self.config.quota
+        line_id = self.namespace.line_id()
+        station_ids = self.namespace.station_ids()
+        per_platform_arrival = self._platform_slice(
+            q.arrival_limit, q.platform_arrival_limit, len(station_ids)
+        )
+        per_platform_depart = self._platform_slice(
+            q.depart_limit, q.platform_depart_limit, len(station_ids)
+        )
+        grants = [
+            Grant(
+                line_id,
+                Q_LEVEL_LINE,
+                q.arrival_limit,
+                q.depart_limit,
+            )
+        ]
+        grants.extend(
+            Grant(
+                station_id,
+                Q_LEVEL_PLATFORM,
+                per_platform_arrival,
+                per_platform_depart,
+                parent=line_id,
+            )
+            for station_id in station_ids
+        )
+        self.quota_book.initialize(
+            grants,
+            return_mode=q.return_mode,
+            downgrade_policy=q.downgrade_policy,
+            idem="quota-seed",
+        )
+
+    @staticmethod
+    def _platform_slice(line_limit: int, configured: int, station_count: int) -> int:
+        """单站台切片：取配置值，但不超过线路总量按站台数平分的上限。"""
+
+        even = max(0, line_limit // max(1, station_count))
+        return max(0, min(configured, line_limit, even if even else configured))
 
     def _restore(self) -> None:
         """从落盘状态恢复操作计数与锁定状态。"""
@@ -375,13 +441,22 @@ class Platform:
                 "violations": violations,
             }
 
-        if not self.quotas.consume(ARRIVAL):
-            return reject("到站配额已用完")
+        # 到站闸门以分级账本（线路/站台/列车三级）为准；旧的两总上限注册表只保留
+        # 作兼容状态视图，不再参与准入决策，避免出现"两套账"。
+        try:
+            self._ensure_train_quota(train_id, station_id)
+            self.quota_book.reserve(
+                Q_ARRIVAL, train_id, station_id, idem=f"arrive-{op_id}"
+            )
+        except QuotaError as error:
+            return reject(f"分级到站配额拒绝：{error.message}")
         try:
             self.namespace.require(station_id)
         except RailError as error:
+            self._rollback_arrival_quota(train_id, op_id)
             return reject(error.message)
         if self.stations.get(station_id) is None:
+            self._rollback_arrival_quota(train_id, op_id)
             return reject(f"站台未登记: {station_id}")
 
         self.signals.raise_signal(train_id, ARRIVAL, self.clock.now())
@@ -396,6 +471,7 @@ class Platform:
         try:
             alignment = self.align.align(train_id, position_m, stop_position, self.clock.now())
         except RailError as error:
+            self._rollback_arrival_quota(train_id, op_id)
             return reject(error.message)
         steps.append(
             {
@@ -407,6 +483,7 @@ class Platform:
         try:
             self.doors_open(train_id, station_id)
         except RailError as error:
+            self._rollback_arrival_quota(train_id, op_id)
             return reject(error.message)
         entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
         report = {
@@ -448,13 +525,21 @@ class Platform:
 
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
-        if not self.quotas.consume(DEPART):
+
+        # 发车闸门同样以分级账本为准。
+        try:
+            self._ensure_train_quota(train_id, station_id)
+            self.quota_book.reserve(
+                Q_DEPART, train_id, station_id, idem=f"depart-{op_id}"
+            )
+            depart_permit = self._latest_permit(train_id, Q_DEPART)
+        except QuotaError as error:
             report = {
                 "ok": False,
                 "train_id": train_id,
                 "station_id": station_id,
                 "steps": steps,
-                "violations": ["发车配额已用完"],
+                "violations": [f"分级发车配额拒绝：{error.message}"],
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
@@ -507,6 +592,9 @@ class Platform:
         departure = depart(self.doors, train_id, self.clock.now())
         if gate is not None:
             self.lockouts.clear(gate.id)
+        # 车已发出：释放到站占用（触发借款 auto 结清 / manual 挂账），发车额度是
+        # 瞬时占用，批准即关闭。两次释放各自幂等，失败不阻断发车信号。
+        quota_detail = self._release_departure_quota(train_id, op_id, depart_permit)
         report = {
             "ok": True,
             "train_id": train_id,
@@ -514,6 +602,7 @@ class Platform:
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
             "cleared_commands": departure["cleared_commands"],
+            "quota": quota_detail,
             "steps": steps,
             "violations": [],
         }
@@ -521,6 +610,46 @@ class Platform:
         self._operations += 1
         self._persist()
         return {**report, **summary}
+
+    def _latest_permit(self, train_id: str, kind: str) -> str:
+        """返回某列车最近一个某类活动占用 id（没有时返回空串）。"""
+
+        permits = [
+            permit
+            for permit in self.quota_book.state.permits.values()
+            if permit.train_id == train_id and permit.kind == kind and permit.active
+        ]
+        permits.sort(key=lambda permit: permit.id)
+        return permits[-1].id if permits else ""
+
+    def _release_departure_quota(self, train_id: str, op_id: str, depart_permit: str) -> dict:
+        """发车成功后归还到站与发车占用，返回配额处理结果。"""
+
+        result = {"arrival_released": "", "depart_released": "", "loans": []}
+        arrival_permit = self._latest_permit(train_id, Q_ARRIVAL)
+        if arrival_permit:
+            try:
+                self.quota_book.release(
+                    arrival_permit, reason="departed", idem=f"arr-ret-{op_id}"
+                )
+                result["arrival_released"] = arrival_permit
+                state = self.quota_book.state
+                result["loans"] = sorted(
+                    loan.id
+                    for loan in state.loans.values()
+                    if loan.permit_id == arrival_permit
+                )
+            except QuotaError:
+                pass
+        if depart_permit:
+            try:
+                self.quota_book.release(
+                    depart_permit, reason="depart_instant", idem=f"dep-ret-{op_id}"
+                )
+                result["depart_released"] = depart_permit
+            except QuotaError:
+                pass
+        return result
 
     def check_gap(self, train_id: str, clear: bool = True) -> dict:
         """确认间隙无异常，或登记一次可疑探测结果。"""
@@ -687,6 +816,11 @@ class Platform:
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
+        quota_cycle = None
+        if self.config.quota.settle_every_cycles > 0 and (
+            self._cycles % self.config.quota.settle_every_cycles == 0
+        ):
+            quota_cycle = self.settle_quota_cycle()
         self._persist()
         return {
             "ok": True,
@@ -697,8 +831,145 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "quota_settlement": quota_cycle,
             "violations": [],
         }
+
+    # ---- 分级配额操作 -------------------------------------------------
+
+    def set_train_priority(self, train_id: str, priority: int) -> dict:
+        """设置列车优先级（数字越小越优先，降级时后砍）。"""
+
+        self._ensure_train_quota(train_id, self._station_of_train(train_id))
+        self.quota_book.set_priority(train_id, priority)
+        self.audit.record("quota_priority", train_id, priority=priority)
+        return {"ok": True, "train_id": train_id, "priority": priority, "violations": []}
+
+    def _station_of_train(self, train_id: str) -> str:
+        entity = self.quota_book.state.entities.get(train_id)
+        return entity.parent if entity is not None else self.namespace.station_ids()[0]
+
+    def set_quota_grants(self, grants: list) -> dict:
+        """在线调整额度（只追加，当前占用超新发放量会被拒绝）。"""
+
+        from .quota import Grant as QuotaGrant
+
+        normalized = [
+            QuotaGrant(
+                entity=str(item["entity"]),
+                level=str(item["level"]),
+                arrival=int(item.get("arrival", 0)),
+                depart=int(item.get("depart", 0)),
+                parent=str(item.get("parent", "")),
+                priority=int(item.get("priority", 100)),
+            )
+            for item in grants
+        ]
+        self.quota_book.set_grants(normalized)
+        self.audit.record("quota_grants", entities=[g.entity for g in normalized])
+        return {"ok": True, "grants": [g.payload() for g in normalized], "violations": []}
+
+    def quota_status(self) -> dict:
+        """分级配额台账快照。"""
+
+        return self.quota_book.status()
+
+    def quota_ledger_info(self) -> dict:
+        """账本完整性与恢复信息（审计/巡检读同一份）。"""
+
+        verify = self.quota_ledger.verify()
+        return {
+            "path": self.quota_ledger.path,
+            "verify": verify,
+        }
+
+    def settle_quota_cycle(self) -> dict:
+        """推进一个配额周期：刷新额度、自动归还/挂账、必要时降级。"""
+
+        result = self.quota_book.settle_cycle()
+        self.audit.record(
+            "quota_settle",
+            "",
+            "",
+            cycle=result.get("cycle"),
+            returned=len(result.get("returned", [])),
+            downgraded=len(result.get("downgraded", [])),
+            defaulted=result.get("defaulted", []),
+            noop=result.get("noop", False),
+        )
+        return result
+
+    def confirm_quota_return(self, loan_ids: list[str] | None = None) -> dict:
+        """人工确认归还 manual 模式下挂账的贷款。"""
+
+        result = self.quota_book.confirm_return(loan_ids)
+        for row in result["returned"]:
+            self.audit.record("quota_return", "", "", loan=row["loan"])
+        return result
+
+    def downgrade_train(self, train_id: str, reason: str = "manual") -> dict:
+        """人工降级一列车并释放其到站占用。"""
+
+        result = self.quota_book.downgrade(train_id, reason=reason)
+        self.audit.record(
+            "quota_downgrade",
+            train_id,
+            "",
+            reason=reason,
+            permit=result.get("permit_released", ""),
+            loans=result.get("loans", []),
+        )
+        return result
+
+    def reclaim_capacity(self, kind: str, station_id: str, need: int = 1) -> dict:
+        """额度不足时按当前策略砍车腾位。"""
+
+        normalized = ARRIVAL if kind == ARRIVAL else DEPART
+        rows = self.quota_book.downgrade_for_capacity(normalized, station_id, need=need)
+        for row in rows:
+            self.audit.record(
+                "quota_reclaim",
+                row["train"],
+                station_id,
+                reason=row.get("reason", ""),
+            )
+        return {"ok": True, "kind": normalized, "station_id": station_id, "downgraded": rows}
+
+    def restore_train(self, train_id: str) -> dict:
+        """恢复被降级的列车。"""
+
+        self.quota_book.restore(train_id)
+        self.audit.record("quota_restore", train_id, "")
+        return {"ok": True, "train_id": train_id, "violations": []}
+
+    def repay_quota_loan(self, loan_id: str) -> dict:
+        """人工补还历史挂账（defaulted）贷款，只追加、不改历史。"""
+
+        self.quota_book.repay_defaulted(loan_id)
+        self.audit.record("quota_repay", "", "", loan=loan_id)
+        return {"ok": True, "loan_id": loan_id, "violations": []}
+
+    def set_quota_policy(
+        self, *, return_mode: str | None = None, downgrade_policy: str | None = None
+    ) -> dict:
+        """切换归还模式 / 降级策略（只追加策略事件）。"""
+
+        self.quota_book.set_policy(
+            return_mode=return_mode, downgrade_policy=downgrade_policy
+        )
+        self.audit.record(
+            "quota_policy",
+            "",
+            "",
+            return_mode=return_mode or "",
+            downgrade_policy=downgrade_policy or "",
+        )
+        return {"ok": True, **self.quota_book.status(), "violations": []}
+
+    def quota_audit(self, limit: int = 200) -> list[dict]:
+        """从账本派生的配额审计条目（与既有审计流同源）。"""
+
+        return self.quota_book.audit_events(limit=limit)
 
     # ---- 查询 ---------------------------------------------------------
 
@@ -745,6 +1016,8 @@ class Platform:
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
+                "hierarchical": self.quota_book.status(),
+                "ledger": self.quota_ledger_info(),
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
@@ -842,6 +1115,33 @@ class Platform:
         return self.store.remove("platform/state")
 
     # ---- 内部 ---------------------------------------------------------
+
+    def _ensure_train_quota(self, train_id: str, station_id: str) -> None:
+        """列车首次出现时按配置登记它那份额度（幂等）。"""
+
+        if train_id in self.quota_book.state.entities:
+            return
+        q = self.config.quota
+        self.quota_book.register_train(
+            train_id,
+            station_id,
+            q.train_arrival_limit,
+            q.train_depart_limit,
+            idem=f"train-quota-{train_id}",
+        )
+
+    def _rollback_arrival_quota(self, train_id: str, op_id: str) -> None:
+        """后续编排步骤失败时，释放在本事务刚占的到站额度，避免占而不用。"""
+
+        try:
+            permit = self.quota_book.state.active_arrival(train_id)
+            if permit is not None:
+                self.quota_book.release(
+                    permit.id, reason="arrive_aborted", idem=f"rollback-{op_id}"
+                )
+        except QuotaError:
+            # 账本释放失败不应掩盖原始编排失败；账目核对由审计与巡检兜底。
+            pass
 
     def _stop_position(self, station_id: str) -> int:
         """返回站台的停稳位置（取最近门区里程）。"""

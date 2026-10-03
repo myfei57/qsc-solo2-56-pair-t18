@@ -42,7 +42,14 @@
   },
   "quota": {
     "arrival_limit": 1000,
-    "depart_limit": 1000
+    "depart_limit": 1000,
+    "platform_arrival_limit": 200,
+    "platform_depart_limit": 200,
+    "train_arrival_limit": 1,
+    "train_depart_limit": 1,
+    "return_mode": "auto",
+    "downgrade_policy": "priority",
+    "settle_every_cycles": 0
   },
   "audit": {
     "journal_segment": 512
